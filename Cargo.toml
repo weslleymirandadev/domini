@@ -3,32 +3,30 @@ name = "domini"
 version = "0.1.0"
 edition = "2024"
 
-[target.armv7-linux-androideabi]
-linker = "/home/bacal/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/arm-linux-androideabi-clang"
-ar = "/home/bacal/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-
-[dependencies]
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1", features = ["v4", "serde"] }
-tracing-subscriber = "0.3.19"
-tracing = "0.1.41"
-reqwest = { version = "0.11", features = ["blocking", "rustls-tls", "json"] }
-hostname = "0.4.1"
-dirs = "6.0.0"
-platform-info = "2.0.5"
-
-
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"
 
 [[bin]]
+name = "agent"
+path = "src/bin/agent.rs"
+
+[[bin]]
 name = "operator"
 path = "src/bin/operator.rs"
 
-[[bin]]
-name = "agent"
-path = "src/bin/agent.rs"
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+warp = { version = "0.3", features = ["tls"] }
+sqlx = { version = "0.6", features = ["runtime-tokio-rustls", "postgres"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.140"
+uuid = { version = "1.0", features = ["v4"] }
+reqwest = { version = "0.11", features = ["json"] }
+hostname = "0.3"
+tokio-tungstenite = "0.17"
+futures = "0.3.31"
+dotenvy = "0.15.7"
+dirs = "6.0.0"
+anyhow = "1.0.98"
+whoami = "1.6.0"
