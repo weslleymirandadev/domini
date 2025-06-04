@@ -249,12 +249,9 @@ impl Operator {
                                 println!("{}", agent);
                             }
                             println!("\n[+] {total} registered agents ({online} online).");
+                            stdout.write_all(b"\nc2> ").await?;
+                            stdout.flush().await?;
                         }
-                        // "response" => {
-                        //     if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
-                        //         println!("Agent output: {}", output);
-                        //     }
-                        // }
                         "details" => {
                             if let Ok(agent) = serde_json::from_value::<Option<Agent>>(value) {
                                 if let Some(agent) = agent {
@@ -263,11 +260,11 @@ impl Operator {
                                     println!("Agent not found.");
                                 }
                             }
+                            stdout.write_all(b"\nc2> ").await?;
+                            stdout.flush().await?;
                         }
                         _ => {}
                     }
-                    stdout.write_all(b"\nc2> ").await?;
-                    stdout.flush().await?;
                 }
             }
         }
