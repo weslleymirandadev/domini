@@ -14,7 +14,8 @@ pub async fn init_db(db: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             latitude DOUBLE PRECISION,
             longitude DOUBLE PRECISION,
             version TEXT NOT NULL,
-            online BOOLEAN NOT NULL DEFAULT false
+            online BOOLEAN NOT NULL DEFAULT false,
+            last_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"
     )
     .execute(db)
@@ -25,7 +26,7 @@ pub async fn init_db(db: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             id SERIAL PRIMARY KEY,
             version TEXT NOT NULL UNIQUE,
             \"binary\" BYTEA NOT NULL,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"
     )
     .execute(db)
@@ -37,8 +38,8 @@ pub async fn init_db(db: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             token TEXT NOT NULL UNIQUE,
             operator_id TEXT NOT NULL UNIQUE,
             public_key BYTEA NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE,
             active BOOLEAN NOT NULL DEFAULT true
         )"
     )
@@ -50,10 +51,45 @@ pub async fn init_db(db: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             id SERIAL PRIMARY KEY,
             command_type TEXT NOT NULL,
             args JSONB NOT NULL,
-            execute_at TIMESTAMP NOT NULL,
+            execute_at TIMESTAMP WITH TIME ZONE NOT NULL,
             executed BOOLEAN NOT NULL DEFAULT false,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'scheduled_tasks' 
+                AND column_name = 'executed'
+            ) THEN
+                ALTER TABLE scheduled_tasks ADD COLUMN executed BOOLEAN NOT NULL DEFAULT false;
+            END IF;
+        END $$;"
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        "DO $$ 
+        BEGIN 
+            IF EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'scheduled_tasks' 
+                AND column_name = 'execute_at' 
+                AND data_type = 'timestamp without time zone'
+            ) THEN
+                ALTER TABLE scheduled_tasks 
+                ALTER COLUMN execute_at TYPE TIMESTAMP WITH TIME ZONE 
+                USING execute_at AT TIME ZONE 'UTC';
+            END IF;
+        END $$;"
     )
     .execute(db)
     .await?;

