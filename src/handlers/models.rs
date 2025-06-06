@@ -110,4 +110,12 @@ pub enum C2Message {
         binary: Vec<u8>,
     },
     VersionCheckAck {},
+    Authenticate {
+        operator_id: String,
+        token: String,
+    },
+    AuthResponse {
+        success: bool,
+        message: String,
+    },
 }
