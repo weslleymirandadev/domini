@@ -16,6 +16,23 @@ use chacha20poly1305::{
 };
 use base64;
 
+const XOR_KEY: [u8; 32] = [
+    0x89, 0x45, 0x23, 0xAB, 0xCD, 0xEF, 0x67, 0x89,
+    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00
+];
+
+const ENCRYPTED_AGENT_KEY: &str = "2mhkUVtYZnFBZ1JwWFJzZEdWamRYSmxaR3RsZVRFeU16UTFOZz09";
+
+fn xor_decrypt_key(encrypted_key: &[u8]) -> [u8; 32] {
+    let mut decrypted = [0u8; 32];
+    for (i, &byte) in encrypted_key.iter().take(32).enumerate() {
+        decrypted[i] = byte ^ XOR_KEY[i];
+    }
+    decrypted
+}
+
 pub struct Agent {
     uuid: String,
     ws: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -24,8 +41,6 @@ pub struct Agent {
 }
 
 const AGENT_VERSION: &str = "1.0.1"; // Current agent version
-// Hardcoded key (Base64-encoded, decodes to 32 bytes)
-const AGENT_PRIVATE_KEY_B64: &str = "k3V9a2J4cXV4cXV5end1dHNlY3VyZWRrZXkxMjM0NTY=";
 
 fn is_agent_up_to_date(version: &str) -> bool {
     version == AGENT_VERSION
@@ -34,8 +49,8 @@ fn is_agent_up_to_date(version: &str) -> bool {
 impl Agent {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         // Decode hardcoded key
-        let agent_key = base64::decode(AGENT_PRIVATE_KEY_B64).map_err(|e| format!("Failed to decode hardcoded AGENT_PRIVATE_KEY: {}", e))?;
-        let agent_key: [u8; 32] = agent_key.try_into().map_err(|_| "Hardcoded key has invalid length (must be 32 bytes)")?;
+        let agent_key = base64::decode(ENCRYPTED_AGENT_KEY).map_err(|e| format!("Failed to decode hardcoded ENCRYPTED_AGENT_KEY: {}", e))?;
+        let agent_key: [u8; 32] = xor_decrypt_key(&agent_key);
 
         let mut uuid = String::new();
         let config_dir = match dirs::home_dir() {

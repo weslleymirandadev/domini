@@ -17,6 +17,23 @@ use uuid::Uuid;
 use warp::Filter;
 use warp::ws::{Message, WebSocket};
 
+const XOR_KEY: [u8; 32] = [
+    0x89, 0x45, 0x23, 0xAB, 0xCD, 0xEF, 0x67, 0x89,
+    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00
+];
+
+const ENCRYPTED_AGENT_KEY: &str = "2mhkUVtYZnFBZ1JwWFJzZEdWamRYSmxaR3RsZVRFeU16UTFOZz09";
+
+fn xor_decrypt_key(encrypted_key: &[u8]) -> [u8; 32] {
+    let mut decrypted = [0u8; 32];
+    for (i, &byte) in encrypted_key.iter().take(32).enumerate() {
+        decrypted[i] = byte ^ XOR_KEY[i];
+    }
+    decrypted
+}
+
 pub struct ServerState {
     pub agents: HashMap<String, mpsc::Sender<Message>>,
     pub clients: HashMap<String, mpsc::Sender<Message>>,
@@ -51,11 +68,9 @@ pub async fn start_server(db: Pool<Postgres>) {
     {
         let db = db.clone();
         let mut state = state.lock().unwrap();
-        let agent_key = base64::decode("k3V9a2J4cXV4cXV5end1dHNlY3VyZWRrZXkxMjM0NTY=")
-            .expect("Failed to decode hardcoded agent key");
-        let agent_key: [u8; 32] = agent_key
-            .try_into()
-            .expect("Hardcoded agent key has invalid length");
+        let encrypted_key = base64::decode(ENCRYPTED_AGENT_KEY)
+            .expect("Failed to decode encrypted agent key");
+        let agent_key = xor_decrypt_key(&encrypted_key);
         state.operator_keys.insert("agent".to_string(), agent_key);
 
         let rows =
